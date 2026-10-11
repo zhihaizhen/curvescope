@@ -11,13 +11,16 @@
  *   https://superteam.fun/api/hackathon/crypto-worlds-fair (37 side tracks).
  *
  * NOTE: DBC has no OHLCV / price-history API (unlike DLMM's datapi). All reads
- * below are on-chain via RPC. `getPools()` is a full getProgramAccounts scan —
- * slow on public RPC; use a dedicated RPC via NEXT_PUBLIC_SOLANA_RPC_URL
- * (e.g. Helius) for production use.
+ * below are on-chain via RPC. Pool listing avoids the SDK's `getPools()`
+ * (full getProgramAccounts scan — downloads every pool, hangs in the
+ * browser); it does an address-only scan + per-pool fetch instead. Use a
+ * dedicated RPC via NEXT_PUBLIC_SOLANA_RPC_URL (e.g. Helius) for
+ * production use.
  */
 import { Connection, PublicKey } from '@solana/web3.js';
 import BN from 'bn.js';
 import {
+  DYNAMIC_BONDING_CURVE_PROGRAM_ID,
   DynamicBondingCurveClient,
   getCurrentPoint,
   swapQuoteExactIn,
@@ -170,22 +173,52 @@ export interface ListDbcPoolsOptions {
 const LIST_LIMIT_DEFAULT = 40;
 
 /**
- * List DBC pools. `getPools()` is a full on-chain scan; we take the first
- * `limit` pools and enrich each with metadata + graduation progress in
- * parallel (failures degrade to fallbacks, never throw the whole list).
+ * List DBC pools without the full-chain download.
+ *
+ * The SDK's `getPools()` does a full getProgramAccounts scan that downloads
+ * EVERY pool's full account data — thousands of pools on mainnet, megabytes
+ * in the browser, effectively hangs. Instead:
+ *   1. Address-only scan: getProgramAccounts with dataSlice(0,0) returns
+ *      just pubkeys (tiny response, seconds not minutes).
+ *   2. Fetch the first `limit` pools individually via `state.getPool()`
+ *      (single getAccountInfo each, in parallel). Non-pool program accounts
+ *      (configs, etc.) return null and are skipped — we over-fetch
+ *      candidates to compensate.
+ *   3. Enrich each with metadata + graduation progress in parallel
+ *      (failures degrade to fallbacks, never throw the whole list).
  */
 export async function listDbcPools(
   opts: ListDbcPoolsOptions = {},
 ): Promise<{ pools: DbcPoolSummary[]; total: number }> {
   const { query = '', limit = LIST_LIMIT_DEFAULT } = opts;
   const dbc = getDbcClient();
-  const all = await dbc.state.getPools();
-  const slice = all.slice(0, Math.max(1, limit));
+  const connection = getConnection();
+
+  const allAccounts = await connection.getProgramAccounts(
+    DYNAMIC_BONDING_CURVE_PROGRAM_ID,
+    { dataSlice: { offset: 0, length: 0 }, commitment: 'confirmed' },
+  );
+  const total = allAccounts.length;
+
+  const candidates = allAccounts.slice(0, Math.max(limit * 3, limit + 20));
+  const fetched = await Promise.all(
+    candidates.map((a) => dbc.state.getPool(a.pubkey).catch(() => null)),
+  );
+  const picked: { address: string; poolState: Record<string, unknown> }[] = [];
+  for (let i = 0; i < fetched.length && picked.length < limit; i++) {
+    const pool = fetched[i];
+    if (!pool) continue;
+    const poolState = (pool as unknown as { poolState?: Record<string, unknown> })
+      .poolState;
+    if (!poolState) continue;
+    picked.push({
+      address: candidates[i].pubkey.toBase58(),
+      poolState,
+    });
+  }
 
   const enriched = await Promise.all(
-    slice.map(async (pa) => {
-      const address = pa.publicKey.toBase58();
-      const poolState = pa.account.poolState as unknown as Record<string, unknown>;
+    picked.map(async ({ address, poolState }) => {
       const baseMint = String(poolState.baseMint ?? '');
       const quoteMint = String(poolState.quoteMint ?? '');
       const isMigrated = Boolean(poolState.isMigrated);
@@ -214,7 +247,7 @@ export async function listDbcPools(
           p.baseMint.toLowerCase().includes(q),
       )
     : enriched;
-  return { pools, total: all.length };
+  return { pools, total };
 }
 
 /** Look up a single pool by base mint (exact match) — powers the search box. */
