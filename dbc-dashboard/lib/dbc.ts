@@ -28,7 +28,7 @@ import {
   type VirtualPool,
   type VirtualPoolMetadata,
 } from '@meteora-ag/dynamic-bonding-curve-sdk';
-import { getConnection } from './solana';
+import { getConnection, SOLANA_RPC_URL } from './solana';
 import { shortAddress } from './format';
 
 /* ------------------------------------------------------------------ */
@@ -173,6 +173,75 @@ export interface ListDbcPoolsOptions {
 const LIST_LIMIT_DEFAULT = 40;
 
 /**
+ * Address-only program-account scan via raw JSON-RPC fetch.
+ *
+ * Why not `connection.getProgramAccounts()`: @solana/web3.js v1 validates RPC
+ * responses with superstruct, and its jayson transport resolves `undefined`
+ * (instead of throwing a useful error) when the endpoint answers HTTP 200
+ * with an EMPTY body — which is what Helius's free tier does when the scan
+ * gets throttled. The app then shows the cryptic
+ * "Expected the value to satisfy a union of `type | type`, but received:
+ * undefined". Raw fetch lets us detect empty/error responses, retry with
+ * backoff, and surface a human-readable message instead.
+ */
+async function fetchProgramAccountAddresses(
+  programId: string,
+  { retries = 3 }: { retries?: number } = {},
+): Promise<string[]> {
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'getProgramAccounts',
+    params: [
+      programId,
+      {
+        encoding: 'base64',
+        dataSlice: { offset: 0, length: 0 },
+        commitment: 'confirmed',
+      },
+    ],
+  });
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(SOLANA_RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        throw new Error(`RPC HTTP ${res.status}: ${text.slice(0, 200)}`);
+      }
+      if (!text) {
+        throw new Error('RPC returned an empty response (throttled?)');
+      }
+      const json = JSON.parse(text) as {
+        result?: { pubkey: string }[];
+        error?: { message?: string };
+      };
+      if (json.error) {
+        // JSON-RPC-level error (e.g. invalid params) — retrying won't help.
+        throw new Error(`RPC error: ${json.error.message ?? 'unknown'}`, {
+          cause: 'fatal',
+        });
+      }
+      if (!Array.isArray(json.result)) {
+        throw new Error('RPC returned an unexpected payload');
+      }
+      return json.result.map((a) => a.pubkey);
+    } catch (e) {
+      if (e instanceof Error && (e.cause as unknown) === 'fatal') throw e;
+      lastError = e;
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 750 * 2 ** attempt));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Pool scan failed');
+}
+
+/**
  * List DBC pools without the full-chain download.
  *
  * The SDK's `getPools()` does a full getProgramAccounts scan that downloads
@@ -192,17 +261,15 @@ export async function listDbcPools(
 ): Promise<{ pools: DbcPoolSummary[]; total: number }> {
   const { query = '', limit = LIST_LIMIT_DEFAULT } = opts;
   const dbc = getDbcClient();
-  const connection = getConnection();
 
-  const allAccounts = await connection.getProgramAccounts(
-    DYNAMIC_BONDING_CURVE_PROGRAM_ID,
-    { dataSlice: { offset: 0, length: 0 }, commitment: 'confirmed' },
+  const addresses = await fetchProgramAccountAddresses(
+    DYNAMIC_BONDING_CURVE_PROGRAM_ID.toBase58(),
   );
-  const total = allAccounts.length;
+  const total = addresses.length;
 
-  const candidates = allAccounts.slice(0, Math.max(limit * 3, limit + 20));
+  const candidates = addresses.slice(0, Math.max(limit * 3, limit + 20));
   const fetched = await Promise.all(
-    candidates.map((a) => dbc.state.getPool(a.pubkey).catch(() => null)),
+    candidates.map((address) => dbc.state.getPool(address).catch(() => null)),
   );
   const picked: { address: string; poolState: Record<string, unknown> }[] = [];
   for (let i = 0; i < fetched.length && picked.length < limit; i++) {
@@ -212,7 +279,7 @@ export async function listDbcPools(
       .poolState;
     if (!poolState) continue;
     picked.push({
-      address: candidates[i].pubkey.toBase58(),
+      address: candidates[i],
       poolState,
     });
   }
