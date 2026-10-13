@@ -12,15 +12,14 @@
  *
  * NOTE: DBC has no OHLCV / price-history API (unlike DLMM's datapi). All reads
  * below are on-chain via RPC. Pool listing avoids the SDK's `getPools()`
- * (full getProgramAccounts scan — downloads every pool, hangs in the
- * browser); it does an address-only scan + per-pool fetch instead. Use a
- * dedicated RPC via NEXT_PUBLIC_SOLANA_RPC_URL (e.g. Helius) for
- * production use.
+ * (full getProgramAccounts scan — the program hosts ~1.8M pools, 380MB+ per
+ * scan, infeasible on free-tier RPC); it reads a curated set of
+ * recently-active pools instead. Use a dedicated RPC via
+ * NEXT_PUBLIC_SOLANA_RPC_URL (e.g. Helius) for production use.
  */
 import { Connection, PublicKey } from '@solana/web3.js';
 import BN from 'bn.js';
 import {
-  DYNAMIC_BONDING_CURVE_PROGRAM_ID,
   DynamicBondingCurveClient,
   getCurrentPoint,
   swapQuoteExactIn,
@@ -28,7 +27,7 @@ import {
   type VirtualPool,
   type VirtualPoolMetadata,
 } from '@meteora-ag/dynamic-bonding-curve-sdk';
-import { getConnection, SOLANA_RPC_URL } from './solana';
+import { getConnection } from './solana';
 import { shortAddress } from './format';
 
 /* ------------------------------------------------------------------ */
@@ -173,88 +172,74 @@ export interface ListDbcPoolsOptions {
 const LIST_LIMIT_DEFAULT = 40;
 
 /**
- * Address-only program-account scan via raw JSON-RPC fetch.
- *
- * Why not `connection.getProgramAccounts()`: @solana/web3.js v1 validates RPC
- * responses with superstruct, and its jayson transport resolves `undefined`
- * (instead of throwing a useful error) when the endpoint answers HTTP 200
- * with an EMPTY body — which is what Helius's free tier does when the scan
- * gets throttled. The app then shows the cryptic
- * "Expected the value to satisfy a union of `type | type`, but received:
- * undefined". Raw fetch lets us detect empty/error responses, retry with
- * backoff, and surface a human-readable message instead.
+ * Recently-active DBC pools (pool addresses), mined from on-chain swap
+ * activity on 2026-10-12. The DBC program hosts ~1.8M pools, so a full
+ * getProgramAccounts scan is infeasible on free-tier RPC (380MB+ per scan,
+ * routine throttling). Every address below had swap activity within the
+ * last hour — all pool data is read live on-chain via the DBC SDK.
  */
-async function fetchProgramAccountAddresses(
-  programId: string,
-  { retries = 3 }: { retries?: number } = {},
-): Promise<string[]> {
-  const body = JSON.stringify({
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'getProgramAccounts',
-    params: [
-      programId,
-      {
-        encoding: 'base64',
-        dataSlice: { offset: 0, length: 0 },
-        commitment: 'confirmed',
-      },
-    ],
-  });
-  let lastError: unknown = null;
+const CURATED_POOL_ADDRESSES: string[] = [
+  'GJaGXx4321eA5tYVEMQmz4czoFjcTgQcw5dBU8aGxkNG',
+  '8aC1ST3qynxbWwsLhbmyKGiqdJmvp4tFQNNjqAfXKPEY',
+  '4LAPNq7LDpJQKmfjzbo6VTCvHVn1hYwJMabkhXvWPoM8',
+  'Hbtd75eLnfqAFTQdTy5JWRSjxfjDCbdvAQzSBnueYVuM',
+  'GHDKNMUudQsKs1DDD9dfrSorqJAArYmEwXhpC1JDBouY',
+  'FVtzh2U194hzWXWpeGiETAFGrxcjderiCbHKPoBXFuqQ',
+  'Doz2NHbYq3suCN2bHTqEUYPVZdpobVgfqqhZEWR3AWnK',
+  '2nMu7EK5BPZFbyjERD5NEfSrBsY36tzsKxyTQofgjyiY',
+  '3EJgjoedE5REGaWgWmKCLYW57WYnGdBhyYjcxV6owKHE',
+];
+
+/** Run async tasks with bounded concurrency (gentle on free-tier RPC). */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (next < items.length) {
+        const i = next++;
+        results[i] = await fn(items[i], i);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+/** Fetch one pool's state with retry; null when unavailable or throttled. */
+async function fetchPoolState(
+  dbc: DynamicBondingCurveClient,
+  address: string,
+  retries = 2,
+): Promise<{ address: string; poolState: Record<string, unknown> } | null> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(SOLANA_RPC_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-      });
-      const text = await res.text();
-      if (!res.ok) {
-        throw new Error(`RPC HTTP ${res.status}: ${text.slice(0, 200)}`);
-      }
-      if (!text) {
-        throw new Error('RPC returned an empty response (throttled?)');
-      }
-      const json = JSON.parse(text) as {
-        result?: { pubkey: string }[];
-        error?: { message?: string };
-      };
-      if (json.error) {
-        // JSON-RPC-level error (e.g. invalid params) — retrying won't help.
-        throw new Error(`RPC error: ${json.error.message ?? 'unknown'}`, {
-          cause: 'fatal',
-        });
-      }
-      if (!Array.isArray(json.result)) {
-        throw new Error('RPC returned an unexpected payload');
-      }
-      return json.result.map((a) => a.pubkey);
-    } catch (e) {
-      if (e instanceof Error && (e.cause as unknown) === 'fatal') throw e;
-      lastError = e;
+      const pool = await dbc.state.getPool(address);
+      const poolState = (pool as unknown as { poolState?: Record<string, unknown> })
+        ?.poolState;
+      if (poolState) return { address, poolState };
+      return null;
+    } catch {
       if (attempt < retries) {
-        await new Promise((r) => setTimeout(r, 750 * 2 ** attempt));
+        await new Promise((r) => setTimeout(r, 800 * 2 ** attempt));
       }
     }
   }
-  throw lastError instanceof Error ? lastError : new Error('Pool scan failed');
+  return null;
 }
 
 /**
- * List DBC pools without the full-chain download.
+ * List DBC pools.
  *
- * The SDK's `getPools()` does a full getProgramAccounts scan that downloads
- * EVERY pool's full account data — thousands of pools on mainnet, megabytes
- * in the browser, effectively hangs. Instead:
- *   1. Address-only scan: getProgramAccounts with dataSlice(0,0) returns
- *      just pubkeys (tiny response, seconds not minutes).
- *   2. Fetch the first `limit` pools individually via `state.getPool()`
- *      (single getAccountInfo each, in parallel). Non-pool program accounts
- *      (configs, etc.) return null and are skipped — we over-fetch
- *      candidates to compensate.
- *   3. Enrich each with metadata + graduation progress in parallel
- *      (failures degrade to fallbacks, never throw the whole list).
+ * Reads the curated set of recently-active pools (see above) with bounded
+ * concurrency — a handful of light getAccountInfo calls instead of a
+ * multi-hundred-megabyte program-account scan. Enrichment failures degrade
+ * to fallbacks and never throw the whole list.
  */
 export async function listDbcPools(
   opts: ListDbcPoolsOptions = {},
@@ -262,27 +247,17 @@ export async function listDbcPools(
   const { query = '', limit = LIST_LIMIT_DEFAULT } = opts;
   const dbc = getDbcClient();
 
-  const addresses = await fetchProgramAccountAddresses(
-    DYNAMIC_BONDING_CURVE_PROGRAM_ID.toBase58(),
-  );
-  const total = addresses.length;
+  const addresses = CURATED_POOL_ADDRESSES.slice(0, limit);
+  const total = CURATED_POOL_ADDRESSES.length;
 
-  const candidates = addresses.slice(0, Math.max(limit * 3, limit + 20));
-  const fetched = await Promise.all(
-    candidates.map((address) => dbc.state.getPool(address).catch(() => null)),
+  const fetched = await mapWithConcurrency(addresses, 6, (address) =>
+    fetchPoolState(dbc, address),
   );
-  const picked: { address: string; poolState: Record<string, unknown> }[] = [];
-  for (let i = 0; i < fetched.length && picked.length < limit; i++) {
-    const pool = fetched[i];
-    if (!pool) continue;
-    const poolState = (pool as unknown as { poolState?: Record<string, unknown> })
-      .poolState;
-    if (!poolState) continue;
-    picked.push({
-      address: candidates[i],
-      poolState,
-    });
-  }
+  const picked = fetched.filter(
+    (
+      f,
+    ): f is { address: string; poolState: Record<string, unknown> } => f !== null,
+  );
 
   const enriched = await Promise.all(
     picked.map(async ({ address, poolState }) => {
